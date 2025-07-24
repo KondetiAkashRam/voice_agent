@@ -368,7 +368,7 @@ export class GdmLiveAudio extends LitElement {
           messages: [
             {
               role: 'system',
-              content: 'You are a friendly and helpful voice assistant. Keep your responses  conversational and you are restricted to answer only questions related to House of Companies and intially say Welcome to House of Companies!, How can we help you?  '
+              content: 'You are a friendly and helpful voice assistant. Keep your responses  conversational and you are restricted to answer only questions related to House of Companies. '
             },
             ...this.conversationHistory
           ],
