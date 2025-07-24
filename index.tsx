@@ -4,11 +4,9 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import {GoogleGenAI, LiveServerMessage, Modality, Session} from '@google/genai';
 import {LitElement, css, html} from 'lit';
 import {customElement, state} from 'lit/decorators.js';
-import {classMap} from 'lit/directives/class-map.js';
-import {createBlob, decode, decodeAudioData} from './utils';
+import OpenAI from 'openai';
 
 @customElement('gdm-live-audio')
 export class GdmLiveAudio extends LitElement {
@@ -17,18 +15,16 @@ export class GdmLiveAudio extends LitElement {
   @state() status = 'Click Start to begin';
   @state() error = '';
 
-  private client: GoogleGenAI;
-  private session: Session | null = null;
-  private inputAudioContext = new (window.AudioContext ||
-    (window as any).webkitAudioContext)({sampleRate: 16000});
-  private outputAudioContext = new (window.AudioContext ||
-    (window as any).webkitAudioContext)({sampleRate: 24000});
-  private outputNode = this.outputAudioContext.createGain();
-  private nextStartTime = 0;
+  private openai: OpenAI;
+  private mediaRecorder: MediaRecorder | null = null;
+  private audioChunks: Blob[] = [];
   private mediaStream: MediaStream | null = null;
-  private sourceNode: AudioBufferSourceNode | null = null;
-  private scriptProcessorNode: ScriptProcessorNode | null = null;
-  private sources = new Set<AudioBufferSourceNode>();
+  private isProcessing = false;
+  private conversationHistory: Array<{role: 'user' | 'assistant', content: string}> = [];
+  private audioContext: AudioContext | null = null;
+  private analyserNode: ScriptProcessorNode | null = null;
+  private silenceTimeout: any = null;
+
 
   static styles = css`
     :host {
@@ -98,105 +94,89 @@ export class GdmLiveAudio extends LitElement {
       margin-bottom: 20px;
     }
 
-    .transcript-container::-webkit-scrollbar {
-      width: 6px;
-    }
-
-    .transcript-container::-webkit-scrollbar-track {
-      background: #2a2a40;
-      border-radius: 3px;
-    }
-
-    .transcript-container::-webkit-scrollbar-thumb {
-      background: #4a4a6a;
-      border-radius: 3px;
-    }
-
-    .transcript-container::-webkit-scrollbar-thumb:hover {
-      background: #5a5a7a;
-    }
-
     .message {
       margin-bottom: 12px;
-      padding: 10px 14px;
+      padding: 12px;
       border-radius: 12px;
-      max-width: 85%;
-      word-wrap: break-word;
-    }
-    
-    .message.status, .message.error {
-      font-style: italic;
-      color: #9e9ec1;
+      font-size: 14px;
+      line-height: 1.4;
       text-align: center;
-      background: none;
-      font-size: 0.9em;
-      align-self: center;
     }
-    
+
+    .message.status {
+      background-color: #2d3f2d;
+      color: #90ee90;
+      font-style: italic;
+    }
+
     .message.error {
-      color: #ff8a8a;
+      background-color: #3f2d2d;
+      color: #ff6b6b;
     }
 
     .controls {
       display: flex;
-      flex-direction: column;
+      gap: 12px;
       align-items: center;
-      gap: 16px;
+      justify-content: center;
       flex-shrink: 0;
     }
 
     .mic-button {
-      width: 80px;
-      height: 80px;
+      width: 64px;
+      height: 64px;
       border-radius: 50%;
       border: none;
-      background-color: #2a2a4a;
-      display: flex;
-      justify-content: center;
-      align-items: center;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
       cursor: pointer;
-      transition: background-color 0.3s, box-shadow 0.3s;
-      color: #e0e0e0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.3s ease;
+      box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
     }
 
-    .mic-button:hover:not(.recording) {
-      background-color: #3a3a5a;
+    .mic-button:hover {
+      transform: scale(1.05);
+      box-shadow: 0 6px 20px rgba(102, 126, 234, 0.6);
     }
-    
+
     .mic-button.recording {
-      background-color: #7b61ff;
-      animation: pulse 1.5s infinite ease-in-out;
+      background: linear-gradient(135deg, #ff6b6b 0%, #ee5a24 100%);
+      animation: pulse 1.5s infinite;
     }
 
-    .mic-button svg {
-      width: 40px;
-      height: 40px;
+    .mic-button:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      transform: none;
     }
 
     @keyframes pulse {
       0% {
-        box-shadow: 0 0 0 0 rgba(123, 97, 255, 0.7);
+        box-shadow: 0 0 0 0 rgba(255, 107, 107, 0.7);
       }
       70% {
-        box-shadow: 0 0 0 20px rgba(123, 97, 255, 0);
+        box-shadow: 0 0 0 10px rgba(255, 107, 107, 0);
       }
       100% {
-        box-shadow: 0 0 0 0 rgba(123, 97, 255, 0);
+        box-shadow: 0 0 0 0 rgba(255, 107, 107, 0);
       }
     }
 
     .stop-button {
-      background-color: #c13a84;
-      color: white;
+      padding: 12px 20px;
+      border-radius: 20px;
       border: none;
-      border-radius: 12px;
-      padding: 10px 24px;
-      font-size: 16px;
-      font-weight: 500;
+      background: linear-gradient(135deg, #ff6b6b 0%, #ee5a24 100%);
+      color: white;
       cursor: pointer;
       display: flex;
       align-items: center;
       gap: 8px;
+      font-size: 14px;
+      font-weight: 500;
       transition: background-color 0.2s;
     }
 
@@ -212,93 +192,10 @@ export class GdmLiveAudio extends LitElement {
 
   constructor() {
     super();
-    this.client = new GoogleGenAI({
-      apiKey: process.env.API_KEY,
+    this.openai = new OpenAI({
+      apiKey: process.env.OPENAI_API_KEY || '',
+      dangerouslyAllowBrowser: true
     });
-    this.initAudio();
-    this.outputNode.connect(this.outputAudioContext.destination);
-  }
-
-  private initAudio() {
-    this.nextStartTime = this.outputAudioContext.currentTime;
-  }
-
-  private async initSession() {
-    const model = 'gemini-2.5-flash-preview-native-audio-dialog';
-
-    try {
-      this.session = await this.client.live.connect({
-        model: model,
-        callbacks: {
-          onopen: () => {
-            this.updateStatus('Connection open.');
-          },
-          onmessage: async (message: LiveServerMessage) => {
-            const audio =
-              message.serverContent?.modelTurn?.parts && message.serverContent.modelTurn.parts[0]?.inlineData;
-
-            if (audio) {
-              this.nextStartTime = Math.max(
-                this.nextStartTime,
-                this.outputAudioContext.currentTime,
-              );
-
-              const audioBuffer = await decodeAudioData(
-                decode(audio.data),
-                this.outputAudioContext,
-                24000,
-                1,
-              );
-              const source = this.outputAudioContext.createBufferSource();
-              source.buffer = audioBuffer;
-              source.connect(this.outputNode);
-              source.addEventListener('ended', () => {
-                this.sources.delete(source);
-              });
-
-              source.start(this.nextStartTime);
-              this.nextStartTime = this.nextStartTime + audioBuffer.duration;
-              this.sources.add(source);
-            }
-
-            const interrupted = message.serverContent?.interrupted;
-            if (interrupted) {
-              for (const source of this.sources.values()) {
-                source.stop();
-                this.sources.delete(source);
-              }
-              this.nextStartTime = 0;
-            }
-          },
-          onerror: (e: unknown) => {
-            if (e instanceof ErrorEvent) {
-              this.updateError(e.message);
-            } else if (typeof e === 'object' && e && 'message' in e) {
-              this.updateError((e as any).message);
-            } else {
-              this.updateError('Unknown error');
-            }
-          },
-          onclose: () => {
-            if (this.sessionActive) {
-              this.updateStatus('Connection closed unexpectedly.');
-              this.endSession();
-            }
-          },
-        },
-        config: {
-          systemInstruction:
-            'You are a helpful assistant for House of Companies. Your knowledge is strictly limited to the content of the website https://houseofcompanies.in/. Answer user questions based only on information from this website. If a question is outside of this scope, politely state that you can only provide information about House of Companies.and and intially say Welcome to House of Companies!, How can we help you?',
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: {prebuiltVoiceConfig: {voiceName: 'Orus'}},
-          },
-        },
-      });
-    } catch (e) {
-      this.updateError(`Connection failed: ${(e as any).message}`);
-      throw e;
-    }
   }
 
   private updateStatus(msg: string) {
@@ -310,13 +207,41 @@ export class GdmLiveAudio extends LitElement {
     this.error = msg;
   }
 
-  private async startRecording() {
-    if (this.isRecording) {
-      return;
+  private async startSession() {
+    if (this.sessionActive) return;
+    
+    this.updateStatus('Starting session...');
+    this.sessionActive = true;
+    this.conversationHistory = [];
+    await this.startRecording();
+  }
+
+  private endSession() {
+    if (!this.sessionActive) return;
+
+    // Stop recording and clean up everything
+    this.sessionActive = false;
+    this.isRecording = false;
+    this.updateStatus('Click Start to begin');
+    this.cleanupAudioAnalyzer();
+
+    if (this.mediaRecorder && this.mediaRecorder.state !== 'inactive') {
+      this.mediaRecorder.onstop = null;
+      this.mediaRecorder.stop();
+    }
+    this.mediaRecorder = null;
+
+    if (this.mediaStream) {
+      this.mediaStream.getTracks().forEach(track => track.stop());
+      this.mediaStream = null;
     }
 
-    this.inputAudioContext.resume();
-    this.updateStatus('Requesting microphone access...');
+    this.audioChunks = [];
+    this.isProcessing = false;
+  }
+
+  private async startRecording() {
+    if (this.isRecording || this.isProcessing) return;
 
     try {
       this.mediaStream = await navigator.mediaDevices.getUserMedia({
@@ -324,89 +249,168 @@ export class GdmLiveAudio extends LitElement {
         video: false,
       });
 
-      this.updateStatus('Listening...');
+      this.audioChunks = [];
+      this.mediaRecorder = new MediaRecorder(this.mediaStream, {
+        mimeType: 'audio/webm;codecs=opus'
+      });
+
+      this.mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          this.audioChunks.push(event.data);
+        }
+      };
+
+      this.mediaRecorder.onstop = async () => {
+        this.cleanupAudioAnalyzer();
+        await this.processAudio();
+        // Automatically restart recording for continuous conversation if session is active
+        if (this.sessionActive) {
+          setTimeout(() => {
+            this.startRecording();
+          }, 1000);
+        }
+      };
+
+      // --- Silence detection setup ---
+      this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const source = this.audioContext.createMediaStreamSource(this.mediaStream);
+      this.analyserNode = this.audioContext.createScriptProcessor(2048, 1, 1);
+      source.connect(this.analyserNode);
+      this.analyserNode.connect(this.audioContext.destination);
+      this.analyserNode.onaudioprocess = (event) => {
+        const input = event.inputBuffer.getChannelData(0);
+        let isSilent = true;
+        for (let i = 0; i < input.length; i++) {
+          if (Math.abs(input[i]) > 0.01) { // threshold
+            isSilent = false;
+            break;
+          }
+        }
+        if (isSilent) {
+          if (!this.silenceTimeout) {
+            this.silenceTimeout = setTimeout(() => {
+              if (this.isRecording) {
+                this.stopRecording();
+              }
+            }, 1000); // 1 second of silence
+          }
+        } else {
+          if (this.silenceTimeout) {
+            clearTimeout(this.silenceTimeout);
+            this.silenceTimeout = null;
+          }
+        }
+      };
+      // --- End silence detection ---
+
+      this.mediaRecorder.start();
       this.isRecording = true;
-
-      if (this.mediaStream) {
-        this.sourceNode = this.inputAudioContext.createMediaStreamSource(
-          this.mediaStream,
-        ) as unknown as AudioBufferSourceNode;
-      }
-
-      const bufferSize = 256;
-      this.scriptProcessorNode = this.inputAudioContext.createScriptProcessor(
-        bufferSize,
-        1,
-        1,
-      );
-
-      if (this.scriptProcessorNode) {
-        this.scriptProcessorNode.onaudioprocess = (audioProcessingEvent) => {
-          if (!this.isRecording) return;
-
-          const inputBuffer = audioProcessingEvent.inputBuffer;
-          const pcmData = inputBuffer.getChannelData(0);
-
-          this.session?.sendRealtimeInput({media: createBlob(pcmData)});
-        };
-      }
-
-      this.sourceNode.connect(this.scriptProcessorNode);
-      this.scriptProcessorNode.connect(this.inputAudioContext.destination);
-    } catch (err: unknown) {
+      this.updateStatus('Listening...');
+    } catch (err) {
       console.error('Error starting recording:', err);
-      if (err && typeof err === 'object' && 'message' in err) {
-        this.updateError(`Mic Error: ${(err as any).message}`);
-      } else {
-        this.updateError('Mic Error: Unknown error');
-      }
+      this.updateError('Failed to access microphone');
       this.isRecording = false;
-      this.endSession();
     }
   }
 
   private stopRecording() {
-    if (!this.isRecording && !this.mediaStream && !this.inputAudioContext)
-      return;
+    if (!this.isRecording || !this.mediaRecorder) return;
 
+    this.mediaRecorder.stop();
     this.isRecording = false;
-    this.updateStatus('Muted');
-
-    if (this.scriptProcessorNode) {
-      this.scriptProcessorNode.disconnect();
-    }
-    if (this.sourceNode) {
-      this.sourceNode.disconnect();
-    }
-
-    this.scriptProcessorNode = null;
-    this.sourceNode = null;
+    this.updateStatus('Processing...');
+    this.cleanupAudioAnalyzer();
 
     if (this.mediaStream) {
-      this.mediaStream.getTracks().forEach((track) => track.stop());
+      this.mediaStream.getTracks().forEach(track => track.stop());
       this.mediaStream = null;
     }
   }
 
-  private async startSession() {
-    if (this.sessionActive) return;
-    this.updateStatus('Connecting...');
-    try {
-      await this.initSession();
-      this.sessionActive = true;
-      await this.startRecording();
-    } catch (e) {
-      this.endSession();
+  private cleanupAudioAnalyzer() {
+    if (this.analyserNode) {
+      this.analyserNode.disconnect();
+      this.analyserNode.onaudioprocess = null;
+      this.analyserNode = null;
+    }
+    if (this.audioContext) {
+      this.audioContext.close();
+      this.audioContext = null;
+    }
+    if (this.silenceTimeout) {
+      clearTimeout(this.silenceTimeout);
+      this.silenceTimeout = null;
     }
   }
 
-  private endSession() {
-    if (!this.sessionActive) return;
-    this.stopRecording();
-    this.session?.close();
-    this.session = null;
-    this.sessionActive = false;
-    this.updateStatus('Click Start to begin');
+  private async processAudio() {
+    if (this.isProcessing) return;
+    this.isProcessing = true;
+
+    try {
+      const audioBlob = new Blob(this.audioChunks, { type: 'audio/webm' });
+      const audioFile = new File([audioBlob], 'audio.webm', { type: 'audio/webm' });
+      
+      // Convert audio to text using OpenAI Whisper
+      const transcription = await this.openai.audio.transcriptions.create({
+        file: audioFile,
+        model: 'whisper-1',
+      });
+
+      const userMessage = transcription.text;
+      if (userMessage.trim()) {
+        this.conversationHistory.push({ role: 'user', content: userMessage });
+        this.updateStatus('Getting response...');
+
+        // Get AI response
+        const completion = await this.openai.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [
+            {
+              role: 'system',
+              content: 'You are a friendly and helpful voice assistant. Keep your responses  conversational and you are restricted to answer only questions related to House of Companies and intially say Welcome to House of Companies!, How can we help you?  '
+            },
+            ...this.conversationHistory
+          ],
+          max_tokens: 150,
+          temperature: 0.7,
+        });
+
+        const assistantMessage = completion.choices[0]?.message?.content || 'Sorry, I couldn\'t process that.';
+        this.conversationHistory.push({ role: 'assistant', content: assistantMessage });
+
+        // Convert response to speech
+        await this.textToSpeech(assistantMessage);
+      }
+
+      this.updateStatus('Click the microphone to speak again');
+    } catch (err) {
+      console.error('Error processing audio:', err);
+      this.updateError('Failed to process audio');
+    } finally {
+      this.isProcessing = false;
+    }
+  }
+
+  private async textToSpeech(text: string) {
+    try {
+      const speechResponse = await this.openai.audio.speech.create({
+        model: 'tts-1',
+        voice: 'alloy',
+        input: text,
+      });
+
+      const audioBlob = await speechResponse.blob();
+      const audioUrl = URL.createObjectURL(audioBlob);
+      
+      const audio = new Audio(audioUrl);
+      audio.onended = () => {
+        URL.revokeObjectURL(audioUrl);
+      };
+      audio.play();
+    } catch (err) {
+      console.error('Error with text-to-speech:', err);
+    }
   }
 
   private toggleRecording() {
@@ -417,15 +421,8 @@ export class GdmLiveAudio extends LitElement {
     }
   }
 
-  updated(changedProperties: Map<string, unknown>) {
-    if (changedProperties.has('status') || changedProperties.has('error')) {
-      const transcriptContainer = this.shadowRoot?.querySelector('.transcript-container');
-      if (transcriptContainer) {
-        setTimeout(() => {
-          transcriptContainer.scrollTop = transcriptContainer.scrollHeight;
-        }, 0);
-      }
-    }
+  updated(_changedProperties: Map<string, unknown>) {
+    // Auto-scroll functionality removed for real-time voice bot
   }
 
   render() {
@@ -461,8 +458,8 @@ export class GdmLiveAudio extends LitElement {
         <div class="header">
           <div class="header-icon">${headerIcon}</div>
           <div class="header-text">
-            <div class="header-title">House of Companies</div>
-            <div class="header-subtitle">How can we help you expand?</div>
+            <div class="header-title">AI Voice Assistant</div>
+            <div class="header-subtitle">Powered by House of Companies</div>
           </div>
         </div>
         <div class="transcript-container">
@@ -470,23 +467,31 @@ export class GdmLiveAudio extends LitElement {
             html`<div class="message status">${this.status}</div>`}
         </div>
         <div class="controls">
-          <button
-            class=${classMap({
-              'mic-button': true,
-              recording: this.isRecording,
-            })}
-            @click=${this.sessionActive ? this.toggleRecording : this.startSession}
-            title=${this.sessionActive ? (this.isRecording ? 'Mute' : 'Unmute') : 'Start Session'}
-            aria-label=${this.sessionActive ? (this.isRecording ? 'Mute microphone' : 'Unmute microphone') : 'Start voice session'}
-          >
-            ${this.isRecording || !this.sessionActive ? micIcon : micOffIcon}
-          </button>
-          
-          ${this.sessionActive ? html`
+          ${!this.sessionActive ? html`
+            <button
+              class="mic-button"
+              @click=${this.startSession}
+              ?disabled=${this.isProcessing}
+              title="Start Session"
+              aria-label="Start voice session"
+            >
+              ${micIcon}
+            </button>
+          ` : html`
+            <button
+              class=${this.isRecording ? 'mic-button recording' : 'mic-button'}
+              @click=${this.toggleRecording}
+              ?disabled=${this.isProcessing}
+              title=${this.isRecording ? 'Stop Recording' : 'Start Recording'}
+              aria-label=${this.isRecording ? 'Stop recording' : 'Start recording'}
+            >
+              ${this.isRecording ? micIcon : micOffIcon}
+            </button>
+            
             <button class="stop-button" @click=${this.endSession}>
               ${stopIcon} Stop
             </button>
-          ` : ''}
+          `}
         </div>
       </div>
     `;
