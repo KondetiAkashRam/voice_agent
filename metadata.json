@@ -1,0 +1,8 @@
+{
+  "name": "Voice Assistant",
+  "description": "A voice assistant powered by Gemini. Interact with an AI using your voice.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "prompt": ""
+}
